@@ -23,7 +23,7 @@ load_dotenv()
 # ==================== КОНФИГ ====================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "9106636927:AAHYZwAyRlilXSacPyGway8S9oxYpoLmCGM")
 OWNER_ID = int(os.getenv("OWNER_ID", "8874871486"))
-GROUP_ID = int(os.getenv("GROUP_ID", "-5448015222"))
+GROUP_ID = int(os.getenv("GROUP_ID", "-1003901902414"))
 SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "@Sm_mts")
 ADMIN_CODE = os.getenv("ADMIN_CODE", "0408")
 CHANNEL_ID = os.getenv("CHANNEL_ID", "-1004436617649")
